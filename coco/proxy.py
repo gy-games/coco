@@ -2,21 +2,21 @@
 # -*- coding: utf-8 -*-
 #
 
-import socket
 import threading
 import time
 import weakref
-import paramiko
+
 from paramiko.ssh_exception import SSHException
 
 from .session import Session
 from .models import Server
+from .connection import SSHConnection
 from .utils import wrap_with_line_feed as wr, wrap_with_warning as warning, \
-    get_private_key_fingerprint, get_logger
+     get_logger
 
 
 logger = get_logger(__file__)
-TIMEOUT = 8
+TIMEOUT = 10
 BUF_SIZE = 4096
 
 
@@ -24,9 +24,9 @@ class ProxyServer:
     def __init__(self, app, client):
         self._app = weakref.ref(app)
         self.client = client
-        self.request = client.request
         self.server = None
         self.connecting = True
+        self.stop_event = threading.Event()
 
     @property
     def app(self):
@@ -47,6 +47,8 @@ class ProxyServer:
         self.app.add_session(session)
         self.watch_win_size_change_async()
         session.bridge()
+        self.stop_event.set()
+        self.end_watch_win_size_change()
         self.app.remove_session(session)
 
     def validate_permission(self, asset, system_user):
@@ -58,20 +60,11 @@ class ProxyServer:
             self.client.user.id, asset.id, system_user.id
         )
 
-    def get_system_user_auth(self, system_user):
-        """
-        获取系统用户的认证信息，密码或秘钥
-        :return: system user have full info
-        """
-        system_user.password, system_user.private_key = \
-            self.app.service.get_system_user_auth_info(system_user)
-
     def get_server_conn(self, asset, system_user):
         logger.info("Connect to {}".format(asset.hostname))
         if not self.validate_permission(asset, system_user):
             self.client.send(warning('No permission'))
             return None
-        self.get_system_user_auth(system_user)
         if True:
             server = self.get_ssh_server_conn(asset, system_user)
         else:
@@ -83,51 +76,26 @@ class ProxyServer:
         pass
 
     def get_ssh_server_conn(self, asset, system_user):
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            ssh.connect(
-                asset.ip, port=asset.port, username=system_user.username,
-                password=system_user.password, pkey=system_user.private_key,
-                timeout=TIMEOUT, compress=True, auth_timeout=10,
-                look_for_keys=False
-            )
-        except (paramiko.AuthenticationException, paramiko.BadAuthenticationType, SSHException):
-            admins = self.app.config['ADMINS'] or 'administrator'
-            self.client.send(warning(wr(
-                "Authenticate with server failed, contact {}".format(admins),
-                before=1, after=0
-            )))
-            password_short = "None"
-            key_fingerprint = "None"
-            if system_user.password:
-                password_short = system_user.password[:5] + (len(system_user.password)-5) * '*'
-            if system_user.private_key:
-                key_fingerprint = get_private_key_fingerprint(system_user.private_key)
-
-            logger.error("Connect {}@{}:{} auth failed, password: {}, key: {}".format(
-                system_user.username, asset.ip, asset.port,
-                password_short, key_fingerprint,
-            ))
-            return None
-        except socket.error as e:
-            self.client.send(wr(" {}".format(e)))
-            return None
-        finally:
-            self.connecting = False
-            self.client.send(b'\r\n')
-
-        term = self.request.meta.get('term', 'xterm')
-        width = self.request.meta.get('width', 80)
-        height = self.request.meta.get('height', 24)
-        chan = ssh.invoke_shell(term, width=width, height=height)
+        ssh = SSHConnection(self.app)
+        request = self.client.request
+        term = request.meta.get('term', 'xterm')
+        width = request.meta.get('width', 80)
+        height = request.meta.get('height', 24)
+        chan, msg = ssh.get_channel(asset, system_user, term=term,
+                                    width=width, height=height)
+        if not chan:
+            self.client.send(warning(wr(msg, before=1, after=0)))
+        self.connecting = False
+        self.client.send(b'\r\n')
         return Server(chan, asset, system_user)
 
     def watch_win_size_change(self):
-        while self.request.change_size_event.wait():
-            self.request.change_size_event.clear()
-            width = self.request.meta.get('width', 80)
-            height = self.request.meta.get('height', 24)
+        while self.client.request.change_size_event.wait():
+            if self.stop_event.is_set():
+                break
+            self.client.request.change_size_event.clear()
+            width = self.client.request.meta.get('width', 80)
+            height = self.client.request.meta.get('height', 24)
             logger.debug("Change win size: %s - %s" % (width, height))
             try:
                 self.server.chan.resize_pty(width=width, height=height)
@@ -139,6 +107,9 @@ class ProxyServer:
         thread.daemon = True
         thread.start()
 
+    def end_watch_win_size_change(self):
+        self.client.request.change_size_event.set()
+
     def send_connecting_message(self, asset, system_user):
         def func():
             delay = 0.0
@@ -149,5 +120,3 @@ class ProxyServer:
                 delay += 0.1
         thread = threading.Thread(target=func)
         thread.start()
-
-

@@ -8,6 +8,7 @@ import time
 import threading
 import socket
 import json
+import signal
 
 from jms.service import AppService
 
@@ -186,7 +187,10 @@ class Coco:
             if self.config['HTTPD_PORT'] != 0:
                 self.run_httpd()
 
-            self.stop_evt.wait()
+            signal.signal(signal.SIGTERM, lambda x, y: self.shutdown())
+            while self.stop_evt.wait(5):
+                print("Coco receive term signal, exit")
+                break
         except KeyboardInterrupt:
             self.stop_evt.set()
             self.shutdown()
@@ -222,7 +226,6 @@ class Coco:
                 self.clients.remove(client)
                 logger.info("Client {} leave, total {} now".format(client, len(self.clients)))
                 client.close()
-                del client
             except:
                 pass
 

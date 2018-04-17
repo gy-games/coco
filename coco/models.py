@@ -3,6 +3,7 @@
 import threading
 import datetime
 import weakref
+import time
 
 from . import char
 from . import utils
@@ -13,13 +14,16 @@ logger = utils.get_logger(__file__)
 
 class Request:
     def __init__(self, addr):
-        self.type = ""
+        self.type = []
         self.meta = {"width": 80, "height": 24}
         self.user = None
         self.addr = addr
         self.remote_ip = self.addr[0]
         self.change_size_event = threading.Event()
         self.date_start = datetime.datetime.now()
+
+    # def __del__(self):
+    #     print("GC: Request object gc")
 
 
 class SizedList(list):
@@ -59,7 +63,11 @@ class Client:
     def send(self, b):
         if isinstance(b, str):
             b = b.encode("utf-8")
-        return self.chan.send(b)
+        try:
+            return self.chan.send(b)
+        except OSError:
+            self.close()
+            return
 
     def recv(self, size):
         return self.chan.recv(size)
@@ -74,8 +82,8 @@ class Client:
     def __str__(self):
         return "<%s from %s:%s>" % (self.user, self.addr[0], self.addr[1])
 
-    def __del__(self):
-        logger.info("GC client object: {}".format(self))
+    # def __del__(self):
+    #     print("GC: Client object has been gc")
 
 
 class Server:
@@ -157,9 +165,9 @@ class Server:
     def close(self):
         logger.info("Closed server {}".format(self))
         self.parse(b'')
-        self.chan.close()
         self.stop_evt.set()
         self.chan.close()
+        self.chan.transport.close()
 
     @staticmethod
     def _have_enter_char(s):
@@ -186,8 +194,8 @@ class Server:
     def __str__(self):
         return "<To: {}>".format(str(self.asset))
 
-    def __del__(self):
-        logger.info("GC server object: {}".format(self))
+    # def __del__(self):
+    #     print("GC: Server object has been gc")
 
 
 class WSProxy:
@@ -243,7 +251,10 @@ class WSProxy:
                 continue
             if len(data) == 0:
                 self.close()
-            self.ws.emit("data", {'data': data.decode("utf-8"), 'room': self.connection}, room=self.room)
+            data = data.decode(errors="ignore")
+            self.ws.emit("data", {'data': data, 'room': self.connection}, room=self.room)
+            if len(data) == BUF_SIZE:
+                time.sleep(0.1)
 
     def auto_forward(self):
         thread = threading.Thread(target=self.forward, args=())

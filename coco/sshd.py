@@ -11,6 +11,7 @@ from .utils import ssh_key_gen, get_logger
 from .interface import SSHInterface
 from .interactive import InteractiveServer
 from .models import Client, Request
+from .sftp import SFTPServer
 
 logger = get_logger(__file__)
 BACKLOG = 5
@@ -60,6 +61,9 @@ class SSHServer:
             logger.warning("Failed load moduli -- gex will be unsupported")
 
         transport.add_server_key(self.host_key)
+        transport.set_subsystem_handler(
+            'sftp', paramiko.SFTPServer, SFTPServer
+        )
         request = Request(addr)
         server = SSHInterface(self.app, request)
         try:
@@ -72,10 +76,16 @@ class SSHServer:
             return
 
         while True:
+            if not transport.is_active():
+                transport.close()
+                sock.close()
+                break
             chan = transport.accept()
+            server.event.wait(5)
+
             if chan is None:
                 continue
-            server.event.wait(5)
+
             if not server.event.is_set():
                 logger.warning("Client not request a valid request, exiting")
                 return
@@ -91,14 +101,13 @@ class SSHServer:
 
     def dispatch(self, client):
         request_type = client.request.type
-        if request_type == 'pty' or request_type == 'x11':
+        if 'pty' in request_type or 'x11' in request_type:
             logger.info("Request type `pty`, dispatch to interactive mode")
             InteractiveServer(self.app, client).interact()
-        elif request_type == 'exec':
-            pass
-        elif request_type == 'subsystem':
+        elif 'subsystem' in request_type:
             pass
         else:
+            logger.info("Request type `{}`".format(request_type))
             client.send("Not support request type: %s" % request_type)
 
     def shutdown(self):
